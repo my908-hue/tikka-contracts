@@ -5,7 +5,7 @@
 use crate::*;
 use soroban_sdk::{
     contract, contractimpl,
-    testutils::{Address as _, Ledger},
+    testutils::Ledger,
     token::StellarAssetClient,
     Address, BytesN, Env, String,
 };
@@ -95,6 +95,7 @@ fn setup_hostile_prize_raffle(
         no_deadline: true,
         max_tickets: 1,
         max_tickets_per_tx: 1,
+        max_tickets_per_address: 0,
         min_tickets: 1,
         allow_multiple: true,
         ticket_price: MIN_TICKET_PRICE,
@@ -103,6 +104,7 @@ fn setup_hostile_prize_raffle(
         prizes: soroban_sdk::vec![env, 10000u32],
         randomness_source: RandomnessSource::Internal,
         oracle_address: None,
+        oracle_public_key: None,
         protocol_fee_bp: 0,
         treasury_address: None,
         swap_router: None,
@@ -114,6 +116,10 @@ fn setup_hostile_prize_raffle(
         early_bird_ticket_percentage: 0,
         early_bird_discount_bp: 0,
         category: None,
+        claim_expiry_seconds: None,
+        bundles: soroban_sdk::Vec::new(env),
+        prize_token: None,
+        nft_contract: None,
     };
 
     client.init(&factory, &admin, &creator, &config);
@@ -187,6 +193,7 @@ fn refund_prize_releases_guard_after_completion() {
         no_deadline: true,
         max_tickets: 1,
         max_tickets_per_tx: 1,
+        max_tickets_per_address: 0,
         min_tickets: 1,
         allow_multiple: true,
         ticket_price: MIN_TICKET_PRICE,
@@ -195,6 +202,7 @@ fn refund_prize_releases_guard_after_completion() {
         prizes: soroban_sdk::vec![&env, 10000u32],
         randomness_source: RandomnessSource::Internal,
         oracle_address: None,
+        oracle_public_key: None,
         protocol_fee_bp: 0,
         treasury_address: None,
         swap_router: None,
@@ -206,6 +214,10 @@ fn refund_prize_releases_guard_after_completion() {
         early_bird_ticket_percentage: 0,
         early_bird_discount_bp: 0,
         category: None,
+        claim_expiry_seconds: None,
+        bundles: soroban_sdk::Vec::new(&env),
+        prize_token: None,
+        nft_contract: None,
     };
 
     client.init(&factory, &admin, &creator, &config);

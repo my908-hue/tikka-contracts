@@ -1,8 +1,9 @@
 import { Alerter } from './alert/alerter';
 import { loadAndValidateConfig } from './config';
 import { startHealthServer } from './health/health.server';
-import { logger } from './logging/logger';
-import { createPipeline } from './pipeline';
+import { configureLogger, logger } from './logging/logger';
+import { createPipeline } from './composition-root';
+import { OraclePipeline } from './pipeline';
 
 /**
  * Bootstrap entry point. Wires the full oracle pipeline and exposes /health and
@@ -10,13 +11,19 @@ import { createPipeline } from './pipeline';
  */
 async function main(): Promise<void> {
   const config = loadAndValidateConfig();
+  configureLogger({ level: config.logLevel, production: config.nodeEnv === 'production' });
 
   const alerter = new Alerter({
     webhookUrl: config.alertWebhookUrl,
     rateLimitMs: config.alertRateLimitMs,
   });
 
-  const healthServer = startHealthServer({ port: config.healthPort });
+  const pipeline = await createPipeline(config, { alerter });
+
+  const healthServer = startHealthServer({
+    port: config.healthPort,
+    healthCheck: () => createHealthSnapshot(pipeline),
+  });
 
   if (!alerter.enabled) {
     logger.warn('ALERT_WEBHOOK_URL is not set; operational alerts are disabled.');
@@ -29,11 +36,10 @@ async function main(): Promise<void> {
     });
   }
 
-  const pipeline = createPipeline(config, { alerter });
-
   const shutdown = (): void => {
     void pipeline.shutdown().finally(() => {
-      healthServer.close();
+      healthServers.health.close();
+      healthServers.metrics.close();
     });
   };
 
@@ -50,7 +56,36 @@ async function main(): Promise<void> {
   await pipeline.start([config.factoryContractId]);
 }
 
+function createHealthSnapshot(pipeline: OraclePipeline): {
+  status: 'ok' | 'degraded';
+  queueDepth: number;
+  deadLetterDepth: number;
+  oldestQueuedAgeMs: number | null;
+  timestamp: number;
+} {
+  const queue = (pipeline as any).requestQueue;
+  const deadLetterStore = (pipeline as any).deadLetterStore;
+  const config = (pipeline as any).config;
+
+  const queueDepth = queue.size();
+  const deadLetterDepth = deadLetterStore.size();
+  const oldestQueuedAgeMs = queue.oldestAgeMs();
+
+  const degraded =
+    queueDepth > config.alertQueueDepthLimit || deadLetterDepth >= 1;
+
+  return {
+    status: degraded ? 'degraded' : 'ok',
+    queueDepth,
+    deadLetterDepth,
+    oldestQueuedAgeMs,
+    timestamp: Date.now(),
+  };
+}
+
 main().catch((error: unknown) => {
-  logger.error(`Oracle service failed to start: ${error instanceof Error ? error.message : String(error)}`);
+  logger.error(
+    `Oracle service failed to start: ${error instanceof Error ? error.message : String(error)}`
+  );
   process.exit(1);
 });

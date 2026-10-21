@@ -1,17 +1,21 @@
 # Error Codes
 
-This document is **auto-generated** from `ProtocolError`. **Do not
-edit by hand.** Regenerate whenever error codes or descriptions change:
+This document is **auto-generated**. **Do not edit by hand.** Regenerate it
+whenever error codes or descriptions change:
 
 ```bash
 python scripts/generate_error_docs.py
 ```
 
 Sources of truth:
+
+- Instance ABI codes: the `Error` enum in
+  [`contracts/raffle-instance/src/lib.rs`](contracts/raffle-instance/src/lib.rs).
+- Factory ABI codes: the `ContractError` enum in
+  [`contracts/raffle-factory/src/lib.rs`](contracts/raffle-factory/src/lib.rs).
 - Canonical catalog: `ProtocolError` in
-  [`contracts/raffle-shared/src/errors.rs`](contracts/raffle-shared/src/errors.rs).
-- Factory ABI codes remain unchanged; the catalog records them next to each
-  namespaced factory code.
+  [`contracts/raffle-shared/src/errors.rs`](contracts/raffle-shared/src/errors.rs);
+  `scripts/check_error_codes.py` enforces that both enums stay in sync with it.
 
 ---
 
@@ -73,6 +77,15 @@ Sources of truth:
 | 68 | `OracleNotRegistered` | Caller is not a registered oracle for this raffle | "Caller is not a registered oracle for this raffle" |
 | 69 | `DuplicateOracleSubmission` | This oracle has already submitted its seed | "This oracle has already submitted its seed" |
 | 70 | `CommitAlreadySubmitted` | A commit has already been submitted for this draw | "This oracle has already committed for this draw" |
+| 71 | `OraclePublicKeyMismatch` | The submitted oracle public key does not match the registered key | "Submitted oracle key does not match the registered key" |
+| 72 | `PrizeSwept` | Prize was swept to the treasury after the claim period expired | "This prize was swept to the treasury" |
+| 100 | `DrawingNotStarted` | Randomness callback arrived before the raffle entered the drawing phase | "Drawing has not started yet" |
+| 101 | `MissingCommit` | Reveal submitted for an oracle with no recorded commitment | "No commit was recorded for this oracle" |
+| 102 | `CommitMismatch` | Revealed pre-image does not match the stored commitment | "The revealed value does not match the commitment" |
+| 103 | `TooFewCommits` | Not enough commitments were recorded to reveal | "Not enough oracle commitments for this round" |
+| 104 | `RandomnessSourceTooWeakForPrize` | Randomness source is too weak for the configured prize | "Randomness source is too weak for this prize" |
+| 105 | `AdminTransferPending` | Admin transfer already pending | "Admin transfer already pending" |
+| 106 | `NoPendingTransfer` | No pending admin transfer | "No pending admin transfer" |
 
 ---
 
@@ -162,5 +175,14 @@ const errorMessages: Record<number, string> = {
   68: "Caller is not a registered oracle for this raffle",
   69: "This oracle has already submitted its seed",
   70: "This oracle has already committed for this draw",
+  71: "Submitted oracle key does not match the registered key",
+  72: "This prize was swept to the treasury",
+  100: "Drawing has not started yet",
+  101: "No commit was recorded for this oracle",
+  102: "The revealed value does not match the commitment",
+  103: "Not enough oracle commitments for this round",
+  104: "Randomness source is too weak for this prize",
+  105: "Admin transfer already pending",
+  106: "No pending admin transfer",
 };
 ```

@@ -27,131 +27,7 @@ fn test_init_claim_lockup_seconds_above_bound_rejected() {
     );
 }
 
-#[test]
-#[cfg(any())]
-fn test_init_claim_lockup_seconds_mid_range_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().set_timestamp(1_000);
 
-    let contract_id = env.register(Contract, ());
-    let client = ContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let creator = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let payment_token = env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    let token = StellarAssetClient::new(&env, &payment_token);
-    let token_ro = soroban_sdk::token::Client::new(&env, &payment_token);
-    token.mint(&creator, &100_000_000);
-    token.mint(&buyer_a, &1_000_000);
-    token.mint(&buyer_b, &1_000_000);
-    token.mint(&buyer_c, &1_000_000);
-
-    // 2. Init the raffle (factory-mediated init emulated directly).
-    let config = lifecycle_config(&env, &payment_token, &treasury);
-    let expected_metadata_hash = config.metadata_hash.clone();
-    let prize_amount = config.prize_amount;
-    let ticket_price = config.ticket_price;
-    let fee_bp = config.protocol_fee_bp as i128;
-    client.init(&creator_factory_addr(&env), &admin, &creator, &config);
-    assert_metadata_hash(&client, &expected_metadata_hash);
-
-    // Skip the factory cross-contract calls in buy_tickets.
-    env.as_contract(&contract_id, || {
-        env.storage().instance().remove(&DataKey::Factory);
-    });
-
-    assert_eq!(client.get_raffle().status, RaffleStatus::PendingPrize);
-    assert_metadata_hash(&client, &expected_metadata_hash);
-
-    // 3. Creator deposits the prize → status becomes Active.
-    let creator_balance_before_deposit = token_ro.balance(&creator);
-    let start_events = env.events().all().len();
-    client.deposit_prize();
-    assert_event(
-        &env,
-        &client.address,
-        "prize_deposited",
-        events::PrizeDeposited {
-            creator: creator.clone(),
-            amount: prize_amount,
-            token: payment_token.clone(),
-            timestamp: env.ledger().timestamp(),
-        },
-    );
-    assert_eq!(env.events().all().len(), start_events + 1);
-    assert_eq!(client.get_raffle().status, RaffleStatus::Active);
-    assert_metadata_hash(&client, &expected_metadata_hash);
-    assert_eq!(
-        token_ro.balance(&creator),
-        creator_balance_before_deposit - prize_amount
-    );
-    assert_eq!(token_ro.balance(&contract_id), prize_amount);
-
-    // 4. Three buyers each purchase one ticket. Each pays ticket_price; the
-    //    protocol fee (1%) is forwarded to the treasury on each purchase.
-    let per_ticket_fee = ticket_price * fee_bp / 10_000;
-    for (idx, buyer) in [&buyer_a, &buyer_b, &buyer_c].iter().enumerate() {
-        let start_events = env.events().all().len();
-        let sold = client.buy_tickets(buyer, &1);
-        
-        assert_event(
-            &env,
-            &client.address,
-            "ticket_purchased",
-            events::TicketPurchased {
-                buyer: buyer.clone(),
-                ticket_ids: soroban_sdk::vec![&env, sold],
-                quantity: 1,
-                ticket_price: ticket_price,
-                effective_ticket_price: ticket_price,
-                total_paid: ticket_price,
-                protocol_fee: ticket_price * fee_bp / 10_000,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        // We know buy_tickets also emits a StatusChanged event when it sells out (the last iteration).
-        if idx < 2 {
-            assert_eq!(env.events().all().len(), start_events + 1);
-        } else {
-            assert_eq!(env.events().all().len(), start_events + 2); // StatusChanged emitted on the last one!
-        }
-        
-        assert_eq!(sold, idx as u32 + 1);
-        assert_metadata_hash(&client, &expected_metadata_hash);
-    }
-    let raffle_after_sales = client.get_raffle();
-    assert_eq!(raffle_after_sales.tickets_sold, 3);
-    // Selling out flips the raffle into Drawing.
-    assert_eq!(raffle_after_sales.status, RaffleStatus::Drawing);
-    assert_eq!(token_ro.balance(&treasury), per_ticket_fee * 3);
-
-    // 5. Finalize → internal randomness picks the winner synchronously.
-    let start_events = env.events().all().len();
-    client.finalize_raffle();
-    
-    assert_event(
-        &env,
-        &client.address,
-        "raffle_finalized",
-        events::RaffleFinalized {
-            raffle_id: client.address.clone(),
-            winners: soroban_sdk::vec![&env, client.get_raffle().winners.get(0).unwrap().address],
-            winning_ticket_ids: soroban_sdk::vec![&env, 1], // buyer_a is first ticket
-            total_tickets_sold: 3,
-            randomness_source: RandomnessSource::Internal,
-            randomness_type: raffle_shared::RandomnessType::PseudoRandom,
-            finalized_at: env.ledger().timestamp(),
-        },
-    );
-    let finalized = client.get_raffle();
-    assert_eq!(finalized.status, RaffleStatus::Finalized);
-    assert_metadata_hash(&client, &expected_metadata_hash);
-    assert_eq!(finalized.winners.len(), 1);
-}
 
 /// #485: with unique_winners, two buyers with multiple tickets each win at most one tier.
 
@@ -206,7 +82,7 @@ fn init_accepts_max_prize_amount_and_rejects_above_it() {
     let client = ContractClient::new(&env, &contract_id);
     let prizes = soroban_sdk::vec![&env, 10000u32];
 
-    let config = init_bounds_config(
+    let mut config = init_bounds_config(
         &env,
         &payment_token,
         String::from_str(&env, "max prize amount"),
@@ -215,6 +91,10 @@ fn init_accepts_max_prize_amount_and_rejects_above_it() {
         MAX_PRIZE_AMOUNT,
         prizes.clone(),
     );
+    // The 1e21 bound is only reachable for non-internal randomness; internal
+    // draws are capped by MAX_INTERNAL_RANDOMNESS_PRIZE_AMOUNT.
+    config.randomness_source = RandomnessSource::External;
+    config.oracle_address = Some(Address::generate(&env));
     client.init(&factory, &admin, &creator, &config);
 
     let invalid = init_bounds_config(
@@ -514,5 +394,41 @@ fn init_rejects_quorum_oracle_equal_to_contract() {
         client.try_init(&factory, &admin, &creator, &config),
         Err(Ok(Error::InvalidParameters))
     );
+}
+
+/// #1244: `oracle_address` may only be paired with the `External` randomness
+/// source — `Internal` and `Quorum` must reject it.
+#[test]
+fn init_rejects_oracle_address_for_non_external_randomness() {
+    let (env, _, factory, admin, creator, payment_token) = init_bounds_env();
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let oracle = Address::generate(&env);
+
+    let mut internal = base_config(&env, &payment_token);
+    internal.randomness_source = RandomnessSource::Internal;
+    internal.oracle_address = Some(oracle.clone());
+    assert_eq!(
+        client.try_init(&factory, &admin, &creator, &internal),
+        Err(Ok(Error::InvalidParameters))
+    );
+
+    let mut oracles = Vec::new(&env);
+    oracles.push_back(oracle.clone());
+    let mut quorum = base_config(&env, &payment_token);
+    quorum.randomness_source = RandomnessSource::Quorum(QuorumConfig { k: 1, oracles });
+    quorum.oracle_address = Some(oracle.clone());
+    assert_eq!(
+        client.try_init(&factory, &admin, &creator, &quorum),
+        Err(Ok(Error::InvalidParameters))
+    );
+
+    // The only valid pairing: `External` randomness with an oracle address.
+    let mut external = base_config(&env, &payment_token);
+    external.randomness_source = RandomnessSource::External;
+    external.oracle_address = Some(oracle);
+    client.init(&factory, &admin, &creator, &external);
+    assert_eq!(client.get_raffle().randomness_source, RandomnessSource::External);
 }
 

@@ -20,9 +20,9 @@
 //!                                                  ticket sales open
 //! ```
 //!
-//! See [`docs/RANDOMNESS.md`](../../../../docs/RANDOMNESS.md) for a full
+//! See [`docs/RANDOMNESS.md`](../../../docs/RANDOMNESS.md) for a full
 //! explanation of the three randomness modes that can be configured here, and
-//! [`docs/EVENTS.md`](../../../../docs/EVENTS.md) for the events emitted by
+//! [`docs/EVENTS.md`](../../../docs/EVENTS.md) for the events emitted by
 //! these functions.
 
 use soroban_sdk::{token, Address, Env};
@@ -35,7 +35,7 @@ use raffle_shared::RaffleConfig;
 
 use crate::events::{PrizeDeposited, RaffleCreated};
 use crate::{
-    helpers::{read_raffle, require_not_paused, transition_status},
+    helpers::{read_raffle, require_not_paused, transition_status, validate_token_address},
     write_raffle, DataKey, Error, Raffle, RaffleStatus,
 };
 
@@ -59,7 +59,7 @@ use crate::{
 /// | `ticket_price` | `≥ MIN_TICKET_PRICE` (10 000 stroops) |
 /// | `prize_amount` | `ticket_price ≤ prize_amount ≤ MAX_PRIZE_AMOUNT` |
 /// | `prizes` | Non-empty, `len ≤ MAX_PRIZES` (100), basis-points sum == 10 000 |
-/// | `protocol_fee_bp` | `≤ 10 000`; charged at ticket purchase only |
+/// | `protocol_fee_bp` | `≤ 10 000`; applied to ticket purchases and prize claims |
 /// | `oracle_address` | Required (and not self) when `randomness_source == External`; forbidden otherwise |
 /// | `metadata_hash` | Must not be the all-zero 32-byte value |
 /// | `category` | See [`validate_category`] |
@@ -92,7 +92,8 @@ use crate::{
 ///
 /// Emits [`events::RaffleCreated`].
 ///
-/// See also: [`docs/EVENTS.md`](../../../../docs/EVENTS.md) — `RaffleCreated`.
+/// See also: [`docs/EVENTS.md`](../../../docs/EVENTS.md) — `RaffleCreated`.
+#[allow(dead_code)]
 pub(crate) fn init(
     env: Env,
     factory: Address,
@@ -112,6 +113,19 @@ pub(crate) fn init(
         ConfigValidationError::TooManyPrizes => Error::TooManyPrizes,
         ConfigValidationError::InvalidTokenAddress => Error::InvalidTokenAddress,
     })?;
+
+    // Validate that the payment_token is a valid token contract.
+    validate_token_address(&env, &config.payment_token)?;
+
+    // Honour the prize-token override if provided; otherwise default to payment_token.
+    if let Some(ref pt) = config.prize_token {
+        validate_token_address(&env, pt)?;
+    }
+    let prize_token = config
+        .prize_token
+        .clone()
+        .unwrap_or_else(|| config.payment_token.clone());
+
     let claim_expiry = config
         .claim_expiry_seconds
         .unwrap_or(DEFAULT_CLAIM_EXPIRY_SECONDS);
@@ -134,7 +148,7 @@ pub(crate) fn init(
         max_tickets_per_address: config.max_tickets_per_address,
         ticket_price: config.ticket_price,
         payment_token: config.payment_token.clone(),
-        prize_token: config.payment_token.clone(),
+        prize_token: prize_token.clone(),
         prize_amount: config.prize_amount,
         prizes: config.prizes.clone(),
         tickets_sold: 0,
@@ -144,6 +158,7 @@ pub(crate) fn init(
         claim_expiry_seconds: claim_expiry,
         randomness_source: config.randomness_source.clone(),
         oracle_address: config.oracle_address,
+        oracle_public_key: config.oracle_public_key,
         protocol_fee_bp: config.protocol_fee_bp,
         treasury_address: config.treasury_address,
         swap_router: config.swap_router,
@@ -157,6 +172,7 @@ pub(crate) fn init(
         metadata_hash: config.metadata_hash.clone(),
         unique_winners: config.unique_winners,
         nft_contract: config.nft_contract,
+        bundles: config.bundles.clone(),
     };
     write_raffle(&env, &raffle);
     env.storage().instance().set(&DataKey::Factory, &factory);
@@ -193,7 +209,7 @@ pub(crate) fn init(
 /// 1. Checks the contract is not paused.
 /// 2. Requires authorization from `raffle.creator`.
 /// 3. Guards against a second deposit (`prize_deposited == true`).
-/// 4. Calls `try_transfer` on the payment token to pull `prize_amount` from
+/// 4. Calls `try_transfer` on the prize token to pull `prize_amount` from
 ///    the creator into this contract address.
 /// 5. Sets `prize_deposited = true` and transitions status from
 ///    [`RaffleStatus::PendingPrize`] → [`RaffleStatus::Active`].
@@ -219,7 +235,7 @@ pub(crate) fn init(
 /// - [`events::RaffleStatusChanged`] — records the `PendingPrize → Active`
 ///   transition.
 ///
-/// See also: [`docs/EVENTS.md`](../../../../docs/EVENTS.md) — `PrizeDeposited`,
+/// See also: [`docs/EVENTS.md`](../../../docs/EVENTS.md) — `PrizeDeposited`,
 /// `RaffleStatusChanged`.
 pub(crate) fn deposit_prize(env: Env) -> Result<(), Error> {
     require_not_paused(&env)?;
@@ -230,16 +246,77 @@ pub(crate) fn deposit_prize(env: Env) -> Result<(), Error> {
         return Err(Error::PrizeAlreadyDeposited);
     }
 
-    let token_client = token::Client::new(&env, &raffle.payment_token);
+    let token_client = token::Client::new(&env, &raffle.prize_token);
     let _ = token_client
-        .try_transfer(&raffle.creator, env.current_contract_address(), &raffle.prize_amount)
+        .try_transfer(
+            &raffle.creator,
+            &env.current_contract_address(),
+            &raffle.prize_amount,
+        )
         .map_err(|_| Error::TokenTransferFailed)?;
 
     raffle.prize_deposited = true;
     let ts = env.ledger().timestamp();
     transition_status(&env, &mut raffle, RaffleStatus::Active, ts)?;
 
-    PrizeDeposited { creator: raffle.creator.clone(), amount: raffle.prize_amount, token: raffle.payment_token.clone(), timestamp: ts }.publish(&env);
+    PrizeDeposited { creator: raffle.creator.clone(), amount: raffle.prize_amount, token: raffle.prize_token.clone(), timestamp: ts }.publish(&env);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::base_config;
+    use crate::RaffleInstance;
+    use soroban_sdk::testutils::Address as _;
+
+    fn token(env: &Env) -> Address {
+        env.register_stellar_asset_contract_v2(Address::generate(env))
+            .address()
+    }
+
+    /// Runs `init` against a freshly registered instance so instance storage
+    /// and `env.current_contract_address()` behave as they do in production.
+    fn run_init(env: &Env, config: raffle_shared::RaffleConfig) -> Result<Raffle, Error> {
+        let instance = env.register(RaffleInstance, ());
+        env.as_contract(&instance, || {
+            init(
+                env.clone(),
+                Address::generate(env),
+                Address::generate(env),
+                Address::generate(env),
+                config,
+            )?;
+            read_raffle(env)
+        })
+    }
+
+    #[test]
+    fn init_defaults_prize_token_to_payment_token() {
+        let env = Env::default();
+        let payment_token = token(&env);
+        let config = base_config(&env, &payment_token);
+
+        let raffle = run_init(&env, config).expect("init should succeed");
+
+        assert_eq!(raffle.prize_token, payment_token);
+    }
+
+    #[test]
+    fn init_honours_and_validates_prize_token_override() {
+        let env = Env::default();
+        let payment_token = token(&env);
+        let prize_token = token(&env);
+
+        let mut config = base_config(&env, &payment_token);
+        config.prize_token = Some(prize_token.clone());
+        let raffle = run_init(&env, config).expect("init should succeed");
+        assert_eq!(raffle.prize_token, prize_token);
+
+        let mut config = base_config(&env, &payment_token);
+        config.prize_token = Some(Address::generate(&env));
+        let result = run_init(&env, config);
+        assert!(matches!(result, Err(Error::InvalidTokenAddress)));
+    }
 }

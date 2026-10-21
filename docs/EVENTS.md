@@ -348,7 +348,6 @@ Topic: `tikka:recurring_raffle_created`
 | `creator` | `Address` |  | Creator that owns the recurring schedule. |
 | `interval_seconds` | `u64` |  | Seconds between consecutive rounds. |
 | `max_rounds` | `u32` |  | Maximum number of rounds; `0` means unlimited. |
-| `auto_fund` | `bool` |  | Whether prize funding for each round happens automatically. |
 | `next_due` | `u64` |  | Ledger timestamp of the next scheduled round. |
 | `timestamp` | `u64` |  | Ledger timestamp of the schedule creation. |
 
@@ -414,7 +413,7 @@ Defined in `contracts\raffle-instance\src\events.rs`.
 
 ## AdminChanged
 
-Emitted when the raffle admin is changed.  Note: this event is `#[allow(dead_code)]` in the current implementation.
+Emitted when the proposed raffle admin accepts an admin transfer.
 
 Topic: `tikka:admin_changed`
 
@@ -425,7 +424,7 @@ Topic: `tikka:admin_changed`
 | `changed_by` | `Address` | topic | Topic: address that changed the admin. |
 | `timestamp` | `u64` |  | Ledger timestamp of the change. |
 
-**Emitted by:** *(no live call sites — defined but not currently published)*
+**Emitted by:** `accept_admin`
 
 ---
 
@@ -443,7 +442,7 @@ Topic: `tikka:cancel_scheduled`
 | `cancel_at` | `u64` |  | Ledger timestamp at which the cancel becomes executable. |
 | `timestamp` | `u64` |  | Ledger timestamp of the schedule. |
 
-**Emitted by:** *(no live call sites — defined but not currently published)*
+**Emitted by:** `cancel_raffle`
 
 ---
 
@@ -501,7 +500,7 @@ Topic: `tikka:emergency_withdrawn`
 
 ## EndTimeExtended
 
-Emitted when the raffle end time is extended.
+Emitted when the raffle end time is extended.  Note: currently `#[allow(dead_code)]` — no end-time extension entrypoint is wired up yet.
 
 Topic: `tikka:end_time_extended`
 
@@ -546,7 +545,7 @@ Topic: `tikka:metadata_hash_updated`
 | `updated_by` | `Address` |  | Address that performed the update. |
 | `timestamp` | `u64` |  | Ledger timestamp of the update. |
 
-**Emitted by:** *(no live call sites — defined but not currently published)*
+**Emitted by:** `update_metadata_hash`
 
 ---
 
@@ -677,7 +676,7 @@ Topic: `tikka:protocol_fee_updated`
 
 ## RaffleCancelled
 
-Emitted when a raffle is cancelled and (if applicable) prizes refunded.
+Emitted when a raffle is cancelled. `prize_refunded` is true only after the prize tokens have actually been transferred back to the creator.
 
 Topic: `tikka:raffle_cancelled`
 
@@ -686,10 +685,10 @@ Topic: `tikka:raffle_cancelled`
 | `creator` | `Address` |  | Address that created the raffle. |
 | `reason` | `CancelReason` |  | Machine-readable cancel reason. |
 | `tickets_sold` | `u32` |  | Number of tickets sold before cancellation. |
-| `prize_refunded` | `bool` |  | Whether the deposited prize was returned to the creator. |
+| `prize_refunded` | `bool` |  | Whether the deposited prize has left escrow and been returned to the creator. |
 | `timestamp` | `u64` |  | Ledger timestamp of the cancellation. |
 
-**Emitted by:** `cancel_raffle`, `trigger_randomness_fallback`
+**Emitted by:** `cancel_raffle`, `execute_admin_cancel`, `trigger_randomness_fallback`
 
 ---
 
@@ -713,6 +712,7 @@ Topic: `tikka:raffle_created`
 | `randomness_source` | `RandomnessSource` |  | Entry point that will drive the draw randomness. |
 | `metadata_hash` | `BytesN<32>` | topic | Topic: SHA-256 of the metadata the description resolves to. |
 | `unique_winners` | `bool` |  | Whether each address may win at most once. |
+| `claim_expiry_seconds` | `u64` |  | Seconds after finalization before unclaimed prizes may be swept. |
 
 **Emitted by:** `init`
 
@@ -737,7 +737,7 @@ Topic: `tikka:raffle_failed`
 
 ## RaffleFinalized
 
-Emitted when the raffle draw completes and winners are recorded.
+Emitted when the raffle is finalized with all winners selected.  ## Ticket-ID convention  `winning_ticket_ids` contains **1-indexed ticket IDs** — one per prize tier, in prize-tier order, parallel to `winners`.  These IDs match `TicketPurchased.ticket_ids` and `WinnerDrawn.ticket_id`, and can be used directly as `DataKey::Ticket(id)` storage keys for independent verification.  Internal draw machinery uses zero-based indices for winner selection (stored in `FairnessMetadata.winning_ticket_indices` for deterministic replay), but this public-facing event always presents 1-indexed IDs.
 
 Topic: `tikka:raffle_finalized`
 
@@ -786,7 +786,7 @@ Topic: `tikka:randomness_fallback_triggered`
 | `fallback_ledger` | `u32` |  | Ledger sequence at which the fallback fired. |
 | `timestamp` | `u64` |  | Ledger timestamp of the fallback. |
 
-**Emitted by:** `trigger_randomness_fallback`
+**Emitted by:** `finalize_raffle`, `trigger_randomness_fallback`
 
 ---
 
@@ -857,7 +857,7 @@ Topic: `tikka:swap_deadline_updated`
 
 ## TicketGifted
 
-Emitted when tickets are bought for another address (a gift).
+Emitted when tickets are bought for another address (a gift).  Note: currently `#[allow(dead_code)]` — gifted purchases publish [`TicketPurchased`] instead.
 
 Topic: `tikka:ticket_gifted`
 
@@ -870,16 +870,16 @@ Topic: `tikka:ticket_gifted`
 | `ticket_price` | `i128` |  | Nominal unit price used for reserved seats. |
 | `effective_ticket_price` | `i128` |  | Effective unit price actually charged (equals `ticket_price` when no discount applies). |
 | `total_paid` | `i128` |  | Total paid by `buyer`. |
-| `protocol_fee` | `i128` |  | Protocol fee (basis points of `total_paid`). |
+| `protocol_fee` | `i128` |  | Protocol fee (basis points of `total_paid`) held for later withdrawal. |
 | `timestamp` | `u64` |  | Ledger timestamp of the gift. |
 
-**Emitted by:** `buy_tickets_for`
+**Emitted by:** *(no live call sites — defined but not currently published)*
 
 ---
 
 ## TicketNftMinted
 
-Emitted once per NFT receipt is successfully minted by the configured `nft_contract`.
+Emitted once per NFT receipt is successfully minted by the configured `nft_contract`.  Note: currently `#[allow(dead_code)]` — minting is performed by the external `nft_contract`, which is not called from this contract yet.
 
 Topic: `tikka:ticket_nft_minted`
 
@@ -909,10 +909,10 @@ Topic: `tikka:ticket_purchased`
 | `ticket_price` | `i128` |  | Nominal unit price used for reserved seats. |
 | `effective_ticket_price` | `i128` |  | Effective unit price actually charged (equals `ticket_price` when no discount applies). |
 | `total_paid` | `i128` |  | Total paid: `effective_ticket_price * quantity` after any discounts. |
-| `protocol_fee` | `i128` |  | Protocol fee (basis points of `total_paid`) withheld and forwarded to the treasury. |
+| `protocol_fee` | `i128` |  | Protocol fee (basis points of `total_paid`) held for later withdrawal. |
 | `timestamp` | `u64` |  | Ledger timestamp of the purchase. |
 
-**Emitted by:** `buy_tickets`
+**Emitted by:** `buy_tickets`, `buy_tickets_for`
 
 ---
 
@@ -929,7 +929,7 @@ Topic: `tikka:ticket_refunded`
 | `amount` | `i128` |  | Amount refunded, denominated in the payment token. |
 | `timestamp` | `u64` |  | Ledger timestamp of the refund. |
 
-**Emitted by:** `refund_ticket`
+**Emitted by:** `batch_refund_tickets`, `refund_ticket`
 
 ---
 
@@ -1048,3 +1048,4 @@ Topic: `tikka:contract_unpaused`
 **Emitted by:** `unpause`, `unpause_factory`
 
 ---
+

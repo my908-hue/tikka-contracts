@@ -57,7 +57,7 @@ pub(crate) fn get_raffle(env: Env) -> Result<crate::Raffle, Error> {
 ///   `FairnessMetadata` written to storage).
 /// - [`Error::NotInitialized`] — the contract has not been initialised.
 ///
-/// See also: [`docs/RANDOMNESS.md`](../../../../docs/RANDOMNESS.md) — audit
+/// See also: [`docs/RANDOMNESS.md`](../../../docs/RANDOMNESS.md) — audit
 /// and replay verification.
 pub(crate) fn get_fairness_data(env: Env) -> Result<FairnessData, Error> {
     let meta: FairnessMetadata = env.storage().persistent().get(&DataKey::RandomnessSeed).ok_or(Error::InvalidStatus)?;
@@ -128,6 +128,17 @@ pub(crate) fn get_stats(env: Env) -> Result<RaffleStats, Error> {
         .checked_mul(raffle.ticket_price)
         .ok_or(Error::ArithmeticOverflow)?;
 
+    let mut claimed_prizes = 0;
+    let mut swept_prizes = 0;
+    for winner in raffle.winners.iter() {
+        if winner.claimed {
+            claimed_prizes += 1;
+        }
+        if winner.swept {
+            swept_prizes += 1;
+        }
+    }
+
     Ok(RaffleStats {
         tickets_sold: raffle.tickets_sold,
         unique_buyers: buyers.len(),
@@ -136,6 +147,8 @@ pub(crate) fn get_stats(env: Env) -> Result<RaffleStats, Error> {
         prize_funded: raffle.prize_deposited,
         status: raffle.status,
         time_remaining,
+        claimed_prizes,
+        swept_prizes,
     })
 }
 
@@ -167,6 +180,7 @@ pub(crate) fn is_ticket_sales_paused(env: Env) -> bool {
 /// `allow_multiple`. A zero per-address cap means unlimited, in which case
 /// `allow_multiple: false` still limits an address to one ticket. The result
 /// never exceeds the raffle-wide remaining capacity.
+#[allow(dead_code)]
 pub(crate) fn get_remaining_ticket_allowance(
     env: Env,
     owner: Address,

@@ -4,9 +4,10 @@ use raffle_shared::CancelReason;
 use raffle_shared::constants::TIMELOCK_DELAY_SECONDS;
 
 use crate::events::{
-    CancelScheduled, ContractPaused, ContractUnpaused, EmergencyWithdrawn, FeesWithdrawn,
-    MetadataHashUpdated, OracleAddressUpdated, ProtocolFeeUpdated, RaffleCancelled, StorageWiped,
-    SwapDeadlineUpdated, TicketSalesPaused, TicketSalesResumed, TokensRescued,
+    AdminChanged, CancelScheduled, ContractPaused, ContractUnpaused, DustSwept,
+    EmergencyWithdrawn, FeesWithdrawn, MetadataHashUpdated, OracleAddressUpdated,
+    ProtocolFeeUpdated, RaffleCancelled, StorageWiped, SwapDeadlineUpdated, TicketSalesPaused,
+    TicketSalesResumed, TokensRescued,
 };
 use crate::{
     calculate_tier_prize, read_raffle, require_admin, write_raffle, DataKey, Error, RaffleStatus,
@@ -26,7 +27,7 @@ fn outstanding_ticket_refunds(env: &Env, raffle: &crate::Raffle) -> Result<i128,
     Ok(outstanding)
 }
 
-fn outstanding_prize(env: &Env, raffle: &crate::Raffle) -> Result<i128, Error> {
+fn outstanding_prize(_env: &Env, raffle: &crate::Raffle) -> Result<i128, Error> {
     if !raffle.prize_deposited {
         return Ok(0);
     }
@@ -39,7 +40,7 @@ fn outstanding_prize(env: &Env, raffle: &crate::Raffle) -> Result<i128, Error> {
         if !raffle
             .winners
             .get(tier_index)
-            .map(|winner| winner.claimed)
+            .map(|winner| winner.claimed || winner.swept)
             .unwrap_or(false)
         {
             outstanding = outstanding
@@ -52,21 +53,20 @@ fn outstanding_prize(env: &Env, raffle: &crate::Raffle) -> Result<i128, Error> {
 
 fn token_entitlement(env: &Env, raffle: &crate::Raffle, token: &Address) -> Result<i128, Error> {
     let mut entitlement = 0i128;
-    if token == &raffle.payment_token
-        && raffle.status != RaffleStatus::Finalized
-        && raffle.status != RaffleStatus::Claimed
-    {
+    if token == &raffle.payment_token {
+        let fees = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
         entitlement = entitlement
-            .checked_add(outstanding_ticket_refunds(env, raffle)?)
-            .and_then(|value| {
-                value.checked_add(
-                    env.storage()
-                        .instance()
-                        .get::<_, i128>(&DataKey::AccumulatedFees)
-                        .unwrap_or(0),
-                )
-            })
+            .checked_add(fees)
             .ok_or(Error::ArithmeticOverflow)?;
+        if raffle.status != RaffleStatus::Finalized && raffle.status != RaffleStatus::Claimed {
+            entitlement = entitlement
+                .checked_add(outstanding_ticket_refunds(env, raffle)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
     }
     if token == &raffle.prize_token {
         entitlement = entitlement
@@ -76,19 +76,53 @@ fn token_entitlement(env: &Env, raffle: &crate::Raffle, token: &Address) -> Resu
     Ok(entitlement)
 }
 
-pub(crate) fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-    let _old = require_admin(&env)?;
+pub(crate) fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+    let current_admin = require_admin(&env)?;
     if !new_admin.exists() || new_admin == env.current_contract_address() {
         return Err(Error::InvalidAdminAddress);
     }
-    // `init` and `require_admin` read/write DataKey::Admin from instance storage;
-    // keep the rotated admin on the same tier or every admin entrypoint bricks
-    // after a rotation (#751).
-    env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+    if new_admin == current_admin {
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        return Ok(());
+    }
+    if env.storage().instance().has(&DataKey::PendingAdmin) {
+        return Err(Error::AdminTransferPending);
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAdmin, &new_admin);
     Ok(())
 }
 
-pub(crate) fn update_oracle_address(env: Env, new_oracle: Address) -> Result<(), Error> {
+pub(crate) fn accept_admin(env: Env) -> Result<(), Error> {
+    let new_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::PendingAdmin)
+        .ok_or(Error::NoPendingTransfer)?;
+    new_admin.require_auth();
+
+    let old_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotAuthorized)?;
+    env.storage().instance().set(&DataKey::Admin, &new_admin);
+    env.storage().instance().remove(&DataKey::PendingAdmin);
+
+    AdminChanged {
+        old_admin,
+        new_admin: new_admin.clone(),
+        changed_by: new_admin,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(&env);
+    Ok(())
+}
+
+pub(crate) fn update_oracle_address(env: Env, new_oracle: Address, new_public_key: Option<BytesN<32>>) -> Result<(), Error> {
     let admin = require_admin(&env)?;
     let mut raffle = read_raffle(&env)?;
     if raffle.randomness_source != raffle_shared::RandomnessSource::External {
@@ -105,6 +139,11 @@ pub(crate) fn update_oracle_address(env: Env, new_oracle: Address) -> Result<(),
     }
     let old = raffle.oracle_address.clone();
     raffle.oracle_address = Some(new_oracle.clone());
+    // FIX(#985): rotate the registered public key atomically with the address.
+    // Failing to do so would leave the old key in place while a new oracle is
+    // registered, allowing the old oracle key to continue passing the binding
+    // check in provide_randomness.
+    raffle.oracle_public_key = new_public_key;
     write_raffle(&env, &raffle);
     OracleAddressUpdated {
         old_oracle: old,
@@ -205,7 +244,7 @@ pub(crate) fn cancel_raffle(env: Env, reason: CancelReason) -> Result<(), Error>
         creator: raffle.creator.clone(),
         reason,
         tickets_sold: raffle.tickets_sold,
-        prize_refunded: raffle.prize_deposited,
+        prize_refunded: false,
         timestamp: env.ledger().timestamp(),
     }
     .publish(&env);
@@ -251,7 +290,7 @@ pub(crate) fn execute_admin_cancel(env: Env) -> Result<(), Error> {
         creator: raffle.creator,
         reason: CancelReason::AdminCancelled,
         tickets_sold: raffle.tickets_sold,
-        prize_refunded: raffle.prize_deposited,
+        prize_refunded: false,
         timestamp: now,
     }
     .publish(&env);
@@ -261,16 +300,16 @@ pub(crate) fn execute_admin_cancel(env: Env) -> Result<(), Error> {
 
 pub(crate) fn update_metadata_hash(env: Env, new_hash: BytesN<32>) -> Result<(), Error> {
     let admin = require_admin(&env)?;
-    let old_hash = env
-        .storage()
-        .instance()
-        .get::<_, BytesN<32>>(&DataKey::MetadataHash)
-        .ok_or(Error::NotInitialized)?;
-    
-    env.storage()
-        .instance()
-        .set(&DataKey::MetadataHash, &new_hash);
-    
+    let mut raffle = crate::read_raffle(&env)?;
+    // The metadata hash is frozen once the prize is in escrow so downstream
+    // verifiers cannot be shown a different payload after deposits begin.
+    if raffle.prize_deposited {
+        return Err(Error::InvalidStatus);
+    }
+    let old_hash = raffle.metadata_hash.clone();
+    raffle.metadata_hash = new_hash.clone();
+    crate::write_raffle(&env, &raffle);
+
     MetadataHashUpdated {
         old_hash,
         new_hash,
@@ -278,7 +317,7 @@ pub(crate) fn update_metadata_hash(env: Env, new_hash: BytesN<32>) -> Result<(),
         timestamp: env.ledger().timestamp(),
     }
     .publish(&env);
-    
+
     Ok(())
 }
 
@@ -380,10 +419,16 @@ pub(crate) fn withdraw_fees(env: Env, recipient: Address, amount: i128) -> Resul
         return Err(Error::InsufficientAccumulatedFees);
     }
     let tc = token::Client::new(&env, &raffle.payment_token);
-    tc.transfer(&env.current_contract_address(), &recipient, &amount);
+    // `try_transfer` carries two error layers: the host invocation error and
+    // the token contract's own soft error. Both must be handled so a declined
+    // transfer cannot silently proceed to the fee bookkeeping below.
+    tc.try_transfer(&env.current_contract_address(), &recipient, &amount)
+        .map_err(|_| Error::TokenTransferFailed)?
+        .map_err(|_| Error::TokenTransferFailed)?;
+    let remaining = acc.checked_sub(amount).ok_or(Error::ArithmeticOverflow)?;
     env.storage()
         .instance()
-        .set(&DataKey::AccumulatedFees, &(acc - amount));
+        .set(&DataKey::AccumulatedFees, &remaining);
     FeesWithdrawn {
         recipient,
         amount,
@@ -592,6 +637,7 @@ pub(crate) fn wipe_storage(env: Env) -> Result<(), Error> {
     env.storage().instance().remove(&DataKey::DrawingLock);
     env.storage().instance().remove(&DataKey::FinishTime);
     env.storage().instance().remove(&DataKey::PendingAdminCancel);
+    env.storage().instance().remove(&DataKey::PendingAdmin);
 
     let submitted_oracles: soroban_sdk::Vec<Address> = env
         .storage()
